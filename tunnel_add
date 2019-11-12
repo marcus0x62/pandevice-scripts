@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+#
+#  Copyright 2019
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+#
+from pandevice import firewall, network, panorama, policies
+from sys import argv, exit
+import ipaddress
+
+# This should be set to either 'firewall' or 'panorama', depending on the desired target
+MODE='panorama'
+
+# Firewall or Panorama IP and credentials
+DEVICE_IP = '192.168.1.1'
+DEVICE_USER='apiuser'
+DEVICE_PASS='password'
+
+# This is only used if MODE is set to Panorama.
+PANORAMA_TEMPLATE='panorama-template'
+
+# 'Shared' tunnel settings.  This script does NOT attempt to create these objects; they must
+# be configured by other means.
+IKE_CRYPTO_PROFILE = 'IKE_AES256-SHA256-DH5'
+IPSEC_CRYPTO_PROFILE = 'IPSEC_ESP-AES256-SHA256'
+IKE_GATEWAY_INTERFACE = 'ethernet1/1'
+IKE_GATEWAY_CIDR = '172.16.200.251'
+IKE_GATEWAY_LOCALID = '172.16.200.251'
+TUNNEL_ZONE = "VPN"
+VR = 'default'
+
+# High-level flow:
+# 1) Identify unused tunnel TunnelInterface
+# 2) Add new tunnel IF
+# 3) Add IPSEC Tunnel & proxy ID
+# 4) Add IKE Gateway
+# 5) Add static route for network to VR
+#
+# Error coverage
+#
+# 1) Validate CLI Arguments
+# 2) Validate template exists, if in Panorama mode
+# 3) Validate tunnel interface is unique
+# 4) Validate IKE gateway and IPSEC tunnel with the same name as the tunnel IF doesn't exist
+# 5) Verify the static route is not currently in the VR
+#
+
+if len(argv) != 4:
+    print("Usage: tunnel_add <PEER_IP> <REMOTE_SUBNET> <PSK>")
+    exit(-1)
+
+# Validate Peer IP argument
+try:
+    ip = ipaddress.IPv4Address(argv[1])
+except ValueError:
+    print("<PEER_IP> argument %s is not a valid IPv4 address" % (argv[1]))
+    exit(-1)
+except:
+    print("An unknown error occurred processing the <PEER_IP> argument")
+    exit(-1)
+
+# Validate Remote Subnet argument
+try:
+    net = ipaddress.IPv4Network(argv[2])
+except ValueError:
+    print("<REMOTE_SUBNET> argument %s is not a valid IPv4 subnet" % (argv[2]))
+    exit(-1)
+except:
+    print("An unknown error occurred processing the <REMOTE_SUBNET> argument")
+    exit(-1)
+
+PEER_IP = argv[1]
+SUBNET = argv[2]
+PSK = argv[3]
+
+print("Warning: this script is not supported by Palo Alto Networks.  Review the configuration it creates carefully and use at your own risk.")
+print("Adding tunnel for %s (%s)" % (PEER_IP, SUBNET))
+
+device = None
+parent = None
+if MODE == 'firewall':
+    device = firewall.Firewall(DEVICE_IP, DEVICE_USER, DEVICE_PASS)
+    parent = device
+elif MODE == 'panorama':
+    device = panorama.Panorama(DEVICE_IP, DEVICE_USER, DEVICE_PASS)
+    parent = panorama.Template(PANORAMA_TEMPLATE)
+    device.add(parent)
+
+    # Validate Template exists
+    try:
+        parent.refresh()
+    except:
+        print("Panorama template %s does not exist" % (PANORAMA_TEMPLATE))
+        exit(-1)
+else:
+    print("***ERROR*** Invalid MODE %s specified" % (MODE))
+    exit(-1)
+
+# Enumerate the existing tunnel interfaces and find the next open sub-interface
+# We put the names of the existing tunnel interfaces in a dictionary and then probe for
+# unused keys
+tif = network.TunnelInterface()
+parent.add(tif)
+c_tifs = network.TunnelInterface.refreshall(parent)
+
+tunnel_map = {}
+for t in c_tifs:
+    tunnel_map[t.name] = True
+
+tunnel_name = None
+for i in range(1,10000):
+    tunnel_name = 'tunnel.%d' % (i)
+    if not tunnel_name in tunnel_map:
+        break
+
+# Create the new interface
+new_if = network.TunnelInterface(tunnel_name)
+parent.add(new_if)
+new_if.create()
+
+# Add the interface to the tunnel zone
+zone = network.Zone(TUNNEL_ZONE)
+parent.add(zone)
+zone.refresh()
+zone.interface.append(tunnel_name)
+zone.create()
+
+# Add the interface to the default VR
+vr = network.VirtualRouter(VR)
+parent.add(vr)
+vr.refresh()
+vr.interface.append(tunnel_name)
+vr.create()
+
+# Create the IKE Gateway
+ike = network.IkeGateway(tunnel_name)
+parent.add(ike)
+ike.version = 'ikev2'
+ike.peer_ip_type = 'dynamic'
+ike.pre_shared_key = PSK
+ike.auth_type = 'pre-shared-key'
+ike.ikev2_crypto_profile = IKE_CRYPTO_PROFILE
+ike.interface = IKE_GATEWAY_INTERFACE
+ike.local_ip_address = IKE_GATEWAY_CIDR
+ike.local_ip_address_type = 'floating-ip'
+ike.local_id_type = 'ipaddr'
+ike.peer_id_type = 'ipaddr'
+ike.local_id_value = IKE_GATEWAY_LOCALID
+ike.peer_id_value = PEER_IP
+ike.create()
+
+# Create the IPSEC Tunnel & proxy ID
+proxy = network.IpsecTunnelIpv4ProxyId()
+proxy.name = 'p0'
+proxy.local = '0.0.0.0/0'
+proxy.remote = SUBNET
+
+ipsec = network.IpsecTunnel(tunnel_name)
+parent.add(ipsec)
+ipsec.add(proxy)
+ipsec.type = 'auto-key'
+ipsec.tunnel_interface = tunnel_name
+ipsec.ak_ike_gateway = tunnel_name
+ipsec.ak_ipsec_crypto_profile = IPSEC_CRYPTO_PROFILE
+ipsec.create()
+
+# Create the static route
+route = network.StaticRoute(tunnel_name)
+vr.add(route)
+route.nexthop_type = None
+route.interface = tunnel_name
+route.destination = SUBNET
+route.create()
+
+print("Successfully created %s" % (tunnel_name))

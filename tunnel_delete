@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+#
+#  Copyright 2019
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+#
+from pandevice import firewall, network, panorama
+from sys import argv, exit
+import ipaddress
+
+# This should be set to either 'firewall' or 'panorama', depending on the desired target
+MODE='panorama'
+
+# Firewall or Panorama IP and credentials
+
+DEVICE_IP = '192.168.1.1'
+DEVICE_USER='apiuser'
+DEVICE_PASS='password'
+
+# This is only used if MODE is set to Panorama.
+PANORAMA_TEMPLATE='panorama-template'
+
+VR = 'default'
+ZONE = 'VPN'
+
+# High-level flow:
+# 1) Enumerate IKE Gateways, Tunnel Interfaces, and Static Routes in specified VR
+# 2) Identify the IKE Gateway with right peer IP
+# 3) Validate a static route for the remote subnet is routed to the tunnel interface listed in the IPSEC Tunnel
+# 4) Delete the static route, IPSEC Tunnel, IKE Gateway, and Tunnel Interface
+
+if len(argv) != 3:
+    print("Usage: tunnel_add <PEER_IP> <REMOTE_SUBNET>")
+    exit(-1)
+
+# Validate Peer IP argument
+try:
+    ip = ipaddress.IPv4Address(argv[1])
+except ValueError:
+    print("<PEER_IP> argument %s is not a valid IPv4 address" % (argv[1]))
+    exit(-1)
+except:
+    print("An unknown error occurred processing the <PEER_IP> argument")
+    exit(-1)
+
+# Validate Remote Subnet argument
+try:
+    net = ipaddress.IPv4Network(argv[2])
+except ValueError:
+    print("<REMOTE_SUBNET> argument %s is not a valid IPv4 subnet" % (argv[2]))
+    exit(-1)
+except:
+    print("An unknown error occurred processing the <REMOTE_SUBNET> argument")
+    exit(-1)
+
+PEER_IP = argv[1]
+SUBNET = argv[2]
+
+print("Warning: this script is not supported by Palo Alto Networks.  Review the configuration it removes carefully and use at your own risk.")
+print("Deleting tunnel for %s (%s)" % (PEER_IP, SUBNET))
+
+device = None
+parent = None
+if MODE == 'firewall':
+    device = firewall.Firewall(DEVICE_IP, DEVICE_USER, DEVICE_PASS)
+    parent = device
+elif MODE == 'panorama':
+    device = panorama.Panorama(DEVICE_IP, DEVICE_USER, DEVICE_PASS)
+    parent = panorama.Template(PANORAMA_TEMPLATE)
+    device.add(parent)
+
+    # Validate Template exists
+    try:
+        parent.refresh()
+    except:
+        print("Panorama template %s does not exist" % (PANORAMA_TEMPLATE))
+        exit(-1)
+else:
+    print("***ERROR*** Invalid MODE %s specified" % (MODE))
+    exit(-1)
+
+
+# Enumerate the IKE gateways and look for one with the right peer IP
+ike_gw_map = network.IkeGateway.refreshall(parent)
+tunnel_id = None
+
+for gw in ike_gw_map:
+    if gw.peer_id_value == PEER_IP:
+        tunnel_id = gw.name
+        print("Found IKE Gateway for peer: %s" % (tunnel_id))
+
+if tunnel_id == None:
+    print("*** FATAL ERROR *** Could not identify IKE Gateway for %s" % (PEER_IP))
+    exit(-1)
+
+ipsec_tunnel = network.IpsecTunnel(tunnel_id)
+parent.add(ipsec_tunnel)
+ipsec_tunnel.refresh()
+
+
+# Verify an IKE gateway with the expected name is associated with the IPSEC Tunnel
+if tunnel_id not in ipsec_tunnel.ak_ike_gateway:
+    print("*** FATAL ERROR *** Could not find IKE Gateway associated with IPSEC tunnel")
+    exit(-1)
+
+# Verify the expected static route is in place
+vr = network.VirtualRouter(VR)
+parent.add(vr)
+vr.refresh()
+
+routes = network.StaticRoute.refreshall(vr)
+
+route_id = None
+for route in routes:
+    if route.destination == SUBNET and route.interface == tunnel_id:
+        print("Found route %s for %s" % (route.name, PEER_IP))
+        route_id = route.name
+
+if route_id == None:
+    print("*** FATAL ERROR *** Could not identify the expected static route for %s" % (SUBNET))
+    exit(-1)
+
+route = network.StaticRoute(route_id)
+vr.add(route)
+route.delete()
+
+vr.interface.remove(tunnel_id)
+vr.update('interface')
+
+ipsec_tunnel.delete()
+
+ike_gw = network.IkeGateway(tunnel_id)
+parent.add(ike_gw)
+ike_gw.delete()
+
+zone = network.Zone(ZONE)
+parent.add(zone)
+zone.refresh()
+zone.interface.remove(tunnel_id)
+zone.update('interface')
+
+tunnel_if = network.TunnelInterface(tunnel_id)
+parent.add(tunnel_if)
+tunnel_if.delete()
+
+print("Successfully removed %s" % (tunnel_id))
